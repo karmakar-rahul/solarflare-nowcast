@@ -1,0 +1,7 @@
+streamlit>=1.31
+torch>=2.0
+numpy
+pandas
+matplotlib
+requests
+scipy
