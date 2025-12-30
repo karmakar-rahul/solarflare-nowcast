@@ -81,30 +81,66 @@ within the **next 60 minutes**.
 # ============================================================
 # Context box (date, weather, context)
 # ============================================================
-def get_weather_context():
+def get_user_location_weather():
+    if "user_weather" in st.session_state:
+        return st.session_state.user_weather
+
     try:
-        response = requests.get(
+        # Primary IP-based location (more Cloud-friendly)
+        loc_response = requests.get(
+            "https://ipinfo.io/json",
+            timeout=5
+        )
+        loc_data = loc_response.json()
+
+        loc = loc_data.get("loc")  # format: "lat,lon"
+        city = loc_data.get("city", "Your location")
+
+        if loc is None:
+            raise ValueError("Location not available")
+
+        latitude, longitude = map(float, loc.split(","))
+
+    except Exception:
+        # Fallback: Equatorial global reference (clearly labeled)
+        latitude, longitude = 0.0, 0.0
+        city = "Global reference"
+
+    try:
+        weather_response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": 26.18,   # Guwahati
-                "longitude": 91.73,
+                "latitude": latitude,
+                "longitude": longitude,
                 "current_weather": True
             },
             timeout=5
         )
-        data = response.json()
-        return f"{data['current_weather']['temperature']:.1f} °C"
+
+        weather_data = weather_response.json()
+        temperature = weather_data["current_weather"]["temperature"]
+
+        st.session_state.user_weather = f"{temperature:.1f} °C ({city})"
+        return st.session_state.user_weather
+
     except Exception:
-        return "Unavailable"
+        st.session_state.user_weather = "Unavailable"
+        return st.session_state.user_weather
+
 
 col_date, col_weather, col_context = st.columns(3)
 
 col_date.metric("Date", datetime.now().strftime("%d %B %Y"))
-col_weather.metric("Local Temperature", get_weather_context())
+col_weather.metric("Local Temperature (User)", get_user_location_weather())
 col_context.metric(
     "Solar Context",
     "Monitoring active conditions" if st.session_state.x_input is not None else "Quiet conditions"
 )
+st.caption(
+    "Local temperature is estimated from approximate IP-based user location "
+    "and is shown for contextual awareness only."
+)
+
 
 # ============================================================
 # Load model (cached, cloud-safe)
