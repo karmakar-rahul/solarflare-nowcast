@@ -1,5 +1,5 @@
 # Solar Flare Early Warning System
-*A high-recall, research-grade nowcasting system using GOES X-ray time series data*
+*A high-recall, research-grade nowcasting system using GOES X-ray time series data.*
 A publicly deployed version of this system is available via **Streamlit Community Cloud**: [Solarflare Nowcast](https://solarflare-nowcast.streamlit.app)
 
 ## Overview
