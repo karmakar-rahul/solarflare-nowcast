@@ -8,9 +8,7 @@ from datetime import datetime
 from src.model import SolarFlareMLP
 from src.predictor import FlarePredictor
 
-# ============================================================
 # Streamlit Cloud & Torch hardening
-# ============================================================
 torch.set_num_threads(1)
 
 st.set_page_config(
@@ -18,9 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# ============================================================
-# Session state initialization (cloud-safe)
-# ============================================================
+# Session state initialization
 for key, default in {
     "x_input": None,
     "goes_df": None,
@@ -31,9 +27,7 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ============================================================
-# Sidebar: Academic About Section
-# ============================================================
+# Sidebar
 st.sidebar.title("System Overview")
 
 with st.sidebar.expander("About this system", expanded=True):
@@ -67,9 +61,7 @@ with st.sidebar.expander("About this system", expanded=True):
     - Multi-horizon forecasting
     """)
 
-# ============================================================
-# Title & description
-# ============================================================
+# Title
 st.title("Solar Flare Early Warning System")
 
 st.markdown("""
@@ -78,35 +70,29 @@ and issues a **binary early warning** for potential solar flare activity
 within the **next 60 minutes**.
 """)
 
-# ============================================================
-# Context box (date, weather, context)
-# ============================================================
+# Date, Weather
 def get_user_location_weather():
-    if "user_weather" in st.session_state:
-        return st.session_state.user_weather
+    # Only cache successful lookups
+    cached = st.session_state.get("user_weather")
+    if cached is not None and cached != "Unavailable":
+        return cached
 
     try:
-        # Primary IP-based location (more Cloud-friendly)
+        # IP-based location (cloud-friendly)
         loc_response = requests.get(
             "https://ipinfo.io/json",
             timeout=5
         )
         loc_data = loc_response.json()
 
-        loc = loc_data.get("loc")  # format: "lat,lon"
+        loc = loc_data.get("loc")  # "lat,lon"
         city = loc_data.get("city", "Your location")
 
-        if loc is None:
-            raise ValueError("Location not available")
+        if not loc:
+            raise ValueError("No location data")
 
         latitude, longitude = map(float, loc.split(","))
 
-    except Exception:
-        # Fallback: Equatorial global reference (clearly labeled)
-        latitude, longitude = 0.0, 0.0
-        city = "Global reference"
-
-    try:
         weather_response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -119,13 +105,18 @@ def get_user_location_weather():
 
         weather_data = weather_response.json()
         temperature = weather_data["current_weather"]["temperature"]
+        if st.button("Retry location detection"):
+         st.session_state.pop("user_weather", None)
+         st.experimental_rerun()
+
 
         st.session_state.user_weather = f"{temperature:.1f} °C ({city})"
         return st.session_state.user_weather
 
     except Exception:
-        st.session_state.user_weather = "Unavailable"
-        return st.session_state.user_weather
+        
+        return "Unavailable"
+
 
 
 col_date, col_weather, col_context = st.columns(3)
@@ -141,10 +132,7 @@ st.caption(
     "and is shown for contextual awareness only."
 )
 
-
-# ============================================================
-# Load model (cached, cloud-safe)
-# ============================================================
+# Load model
 @st.cache_resource
 def load_model():
     checkpoint = torch.load(
@@ -161,9 +149,8 @@ predictor = FlarePredictor(model)
 
 st.success("Model loaded successfully")
 
-# ============================================================
-# Input configuration (two-column layout)
-# ============================================================
+
+# Input configuration 
 st.markdown("### Input Configuration")
 
 col_input, col_scenario = st.columns(2)
@@ -194,9 +181,8 @@ with col_scenario:
     else:
         scenario = None
 
-# ============================================================
 # Example scenario generator
-# ============================================================
+
 def generate_example(scenario):
     if scenario == "Quiet Sun":
         base, noise = -6.0, 0.12
@@ -210,9 +196,8 @@ def generate_example(scenario):
 
     return np.stack([xrs_short, xrs_long], axis=1)
 
-# ============================================================
+
 # Input handling
-# ============================================================
 if input_mode == "Example scenarios":
     st.session_state.x_input = generate_example(scenario)
     st.session_state.goes_df = None
@@ -246,9 +231,7 @@ else:
             st.session_state.x_input = None
             st.warning("Live GOES data currently unavailable")
 
-# ============================================================
 # Visualization
-# ============================================================
 if st.session_state.x_input is not None:
     st.subheader("GOES X-ray Flux (Last 6 Hours)")
 
@@ -270,9 +253,8 @@ if st.session_state.x_input is not None:
 
     st.caption(f"Data source: {st.session_state.data_source}")
 
-# ============================================================
-# Prediction + documented demo calibration
-# ============================================================
+
+# Prediction
 st.subheader("Flare Warning Output")
 
 if st.session_state.x_input is not None and st.button("Run Prediction"):
