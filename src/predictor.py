@@ -14,16 +14,12 @@ Changes from original:
 import numpy as np
 import torch
 from collections import deque
-
-
 RISK_LEVELS = [
-    (0.75, "HIGH"),
-    (0.50, "ELEVATED"),
-    (0.25, "MODERATE"),
-    (0.00, "LOW"),
+    (0.75, "HIGH",    "🔴"),
+    (0.50, "ELEVATED","🟠"),
+    (0.25, "MODERATE","🟡"),
+    (0.00, "LOW",     "🟢"),
 ]
-
-
 class FlarePredictor:
     """
     Wraps the trained SolarFlareCNN for single-step or streaming inference.
@@ -59,9 +55,7 @@ class FlarePredictor:
         if model_class is None:
             from src.model import build_model
             model_class = build_model
-
         ckpt = torch.load(checkpoint_path, map_location=device)
-
         # Support both a plain state_dict and a full checkpoint dict
         if isinstance(ckpt, dict) and "model_state" in ckpt:
             cfg = ckpt.get("cfg", {})
@@ -83,14 +77,11 @@ class FlarePredictor:
         return cls(model, threshold=threshold, device=device)
 
     # Core inference 
-
     def predict_raw(self, x: np.ndarray) -> float:
         """
         Single forward pass.
-
         Args:
             x : np.ndarray of shape (360, 5) — one 6-hour window
-
         Returns:
             float probability in [0, 1]
         """
@@ -106,10 +97,8 @@ class FlarePredictor:
     def predict(self, x: np.ndarray) -> tuple:
         """
         Predict with temporal smoothing.
-
         Args:
             x : np.ndarray of shape (360, 5)
-
         Returns:
             (smoothed_prob, flare_warning)
                 smoothed_prob  : float — running mean of last `history_size` raw probs
@@ -126,12 +115,12 @@ class FlarePredictor:
         Map a probability to a human-readable risk level.
 
         Returns:
-            (label, emoji)  e.g. ("HIGH")
+            (label, emoji)  e.g. ("HIGH", "🔴")
         """
         for threshold, label, emoji in RISK_LEVELS:
             if prob >= threshold:
                 return label, emoji
-        return "LOW"
+        return "LOW", "🟢"
 
     def reset_history(self):
         """Clear the smoothing buffer (call when switching data sources)."""
