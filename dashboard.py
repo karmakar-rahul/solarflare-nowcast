@@ -16,23 +16,75 @@ Key changes from the original:
 import numpy as np
 import pandas as pd
 import requests
+
 import streamlit as st
 import torch
 from datetime import datetime, timezone
 
 from src.model import build_model
 from src.predictor import FlarePredictor
+from streamlit_js_eval import get_geolocation
+@st.cache_data(ttl=600)
+def get_location_weather():
+    """
+    Detect user location and fetch current weather.
+    Cache for 10 minutes.
+    """
+
+    try:
+        # Get user location
+        location_data = requests.get(
+            "https://ipapi.co/json/",
+            timeout=5
+        ).json()
+
+        city = location_data.get("city", "Unknown")
+        region = location_data.get("region", "")
+        country = location_data.get("country_name", "")
+
+        lat = location_data.get("latitude")
+        lon = location_data.get("longitude")
+
+        if lat is None or lon is None:
+            raise ValueError("Coordinates unavailable")
+
+        # Open-Meteo API (no API key required)
+        weather = requests.get(
+            (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}"
+                f"&longitude={lon}"
+                f"&current=temperature_2m"
+            ),
+            timeout=5,
+        ).json()
+
+        temp = weather["current"]["temperature_2m"]
+
+        return {
+            "location": f"{city}, {region}",
+            "temperature": f"{temp:.1f}°C",
+            "country": country,
+        }
+
+    except Exception:
+        return {
+            "location": "Unavailable",
+            "temperature": "--",
+            "country": "",
+        }
 
 # Page config 
 
 st.set_page_config(
     page_title="Solar Flare Early Warning System",
+    page_icon="☀️",
     layout="wide",
 )
 
 torch.set_num_threads(1)
 
-#  Session state defaults
+#  Session state defaults 
 
 DEFAULTS = {
     "x_input":     None,   # (360, 5) float32 array
@@ -47,6 +99,8 @@ for key, val in DEFAULTS.items():
 # Model loading 
 
 CHECKPOINT_PATH = "checkpoints/best_model.pt"
+
+
 @st.cache_resource
 def load_predictor():
     try:
@@ -95,18 +149,16 @@ Accuracy is not used (useless for rare events).
 Always consult [NOAA SWPC](https://www.swpc.noaa.gov/) for operational alerts.
         """)
 
-    with st.expander("Risk levels"):
-        st.markdown("""
-| Level | Probability | Meaning |
-|---|---|---|
-| HIGH | ≥ 0.75 | Strong precursor signal |
-| ELEVATED | ≥ 0.50 | Notable activity |
-| MODERATE | ≥ 0.25 | Mild activity |
-| LOW | < 0.25 | Quiet sun |
-        """)
+    with st.expander("Risk Levels"):
 
-# Header 
-st.title(" Solar Flare Early Warning System")
+     st.error("🔴 HIGH (≥ 0.75)\n\nStrong precursor signal")
+     st.warning("🟠 ELEVATED (≥ 0.50)\n\nNotable solar activity")
+     st.info("🟡 MODERATE (≥ 0.25)\n\nMild activity detected")
+     st.success("🟢 LOW (< 0.25)\n\nQuiet Sun conditions")
+
+# Header
+
+st.title("Solar Flare Early Warning System")
 st.markdown(
     "Analyzes the **last 6 hours of GOES X-ray flux** and issues a binary early warning "
     "for potential solar flare activity within the **next 60 minutes**."
@@ -114,32 +166,38 @@ st.markdown(
 
 # Model status banner
 if model_error:
-    st.error(f" Model not loaded: {model_error}")
+    st.error(f"Model not loaded: {model_error}")
 elif predictor:
-    st.success(f" Model loaded  |  Decision threshold: **{predictor.threshold:.2f}**")
+    st.success(f"Model loaded  |  Decision threshold: **{predictor.threshold:.2f}**")
 
 # Status metrics row 
-
-col_date, col_utc, col_status = st.columns(3)
-col_date.metric("Date (UTC)", datetime.now(timezone.utc).strftime("%d %B %Y"))
-col_utc.metric("Time (UTC)", datetime.now(timezone.utc).strftime("%H:%M"))
+weather_info = get_location_weather()
+col_loc, col_temp, col_status = st.columns(3)
+col_loc.metric(
+    "Location",
+    weather_info["location"]
+)
+col_temp.metric(
+    "Temperature",
+    weather_info["temperature"]
+)
 col_status.metric(
     "Data Status",
-    "Input loaded" if st.session_state.x_input is not None else "No data loaded"
+    "Input loaded"
+    if st.session_state.x_input is not None
+    else "No data loaded"
 )
-
 st.divider()
 
 # Input configuration 
-st.subheader(" Input Configuration")
-
+st.subheader("Input Configuration")
 input_mode = st.radio(
     "Select input source",
     ["Example scenarios", "Upload GOES CSV", "Fetch Latest GOES Data (Live)"],
     horizontal=True,
 )
 
-# Scenario generator  
+# Scenario generator (model-driven, no manual boosting)
 SCENARIOS = {
     "Quiet Sun": {
         "desc": "Typical background solar minimum conditions.",
@@ -160,6 +218,8 @@ SCENARIOS = {
         "trend": 0.008, "spike_at": 330,
     },
 }
+
+
 def generate_scenario(name: str) -> tuple:
     cfg = SCENARIOS[name]
     t = np.arange(360)
@@ -187,7 +247,9 @@ def generate_scenario(name: str) -> tuple:
         "rolling_max": rolling_max,
     })
     return x.astype(np.float32), df
-# Handle input modes
+
+
+# Handle input modes 
 if input_mode == "Example scenarios":
     col_sel, col_desc = st.columns([1, 2])
     with col_sel:
@@ -247,7 +309,7 @@ else:  # Live GOES
                 st.warning(f"Live data unavailable: {e}")
                 st.session_state.x_input = None
 
-# Visualisation 
+# Visualisation
 if st.session_state.x_input is not None:
     st.divider()
     st.subheader("GOES X-ray Flux (Last 6 Hours)")
@@ -268,7 +330,7 @@ if st.session_state.x_input is not None:
 
     st.caption(f"Data source: **{st.session_state.data_source}**")
 
-# Prediction 
+# Prediction
 st.divider()
 st.subheader("Flare Warning Output")
 
@@ -277,7 +339,7 @@ if st.session_state.x_input is None:
 elif not predictor:
     st.warning("Model not loaded. Train the model first with `python train.py`.")
 else:
-    if st.button("▶ Run Prediction", type="primary"):
+    if st.button("Run Prediction", type="primary"):
         with st.spinner("Running inference..."):
             prob, warning = predictor.predict(st.session_state.x_input)
             level, emoji  = predictor.get_risk_level(prob)
@@ -294,17 +356,17 @@ else:
 
         if pred["warning"]:
             st.error(
-                f"{pred['emoji']} {pred['level']} RISK — "
+                f"**{pred['emoji']} {pred['level']} RISK** — "
                 "Elevated flare probability detected for the next 60 minutes. "
                 "Monitor [NOAA SWPC](https://www.swpc.noaa.gov/) for official alerts."
             )
         elif pred["level"] in ("MODERATE", "ELEVATED"):
             st.warning(
-                f"{pred['emoji']} {pred['level']} ACTIVITY — "
+                f"**{pred['emoji']} {pred['level']} ACTIVITY** — "
                 "Some X-ray flux activity present. Continue monitoring."
             )
         else:
-            st.success("LOW RISK: No immediate flare activity detected.")
+            st.success("**🟢 LOW RISK** — No immediate flare activity detected.")
 
         with st.expander("Prediction details"):
             st.markdown(f"""
