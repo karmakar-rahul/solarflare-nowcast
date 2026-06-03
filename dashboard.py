@@ -1,282 +1,324 @@
-import streamlit as st
+"""
+dashboard.py
+------------
+Solar Flare Early Warning System — Streamlit Dashboard
+
+Key changes from the original:
+  • Removed hardcoded probability boosting (the raw_prob + 0.75 hack is gone)
+  • Uses 5-channel feature engineering to match training pipeline
+  • Live GOES data fetching via goes_fetcher (5 channels)
+  • CSV upload via goes_loader (5 channels)
+  • Displays all 5 feature channels in the chart
+  • Shows TSS-calibrated risk levels (LOW / MODERATE / ELEVATED / HIGH)
+  • All scenario probabilities are now from the actual model, not manual offsets
+"""
+
 import numpy as np
-import torch
 import pandas as pd
 import requests
-from datetime import datetime
+import streamlit as st
+import torch
+from datetime import datetime, timezone
 
-from src.model import SolarFlareMLP
+from src.model import build_model
 from src.predictor import FlarePredictor
 
-# Streamlit Cloud & Torch hardening
-torch.set_num_threads(1)
+# Page config 
 
 st.set_page_config(
     page_title="Solar Flare Early Warning System",
-    layout="wide"
+    layout="wide",
 )
 
-# Session state initialization
-for key, default in {
-    "x_input": None,
-    "goes_df": None,
-    "data_source": None,
-    "input_mode": "Example scenarios",
-    "prediction": None,
-}.items():
+torch.set_num_threads(1)
+
+#  Session state defaults
+
+DEFAULTS = {
+    "x_input":     None,   # (360, 5) float32 array
+    "goes_df":     None,   # DataFrame for chart display
+    "data_source": None,   # string label for display
+    "prediction":  None,   # dict with prob, warning, level
+}
+for key, val in DEFAULTS.items():
     if key not in st.session_state:
-        st.session_state[key] = default
+        st.session_state[key] = val
 
-# Sidebar
-st.sidebar.title("System Overview")
+# Model loading 
 
-with st.sidebar.expander("About this system", expanded=True):
-    st.markdown("""
-    **Solar Flare Early Warning System**
-
-    This application implements a machine-learning-based early warning
-    framework for identifying potential solar flare activity using
-    **GOES X-ray flux time series data**.
-
-    **Input window:** 360 minutes (6 hours)  
-    **Forecast horizon:** 60 minutes  
-
-    The model is formulated as a **binary classifier** under extreme
-    class imbalance and optimized for **high recall**, where missing
-    a flare event is considered more critical than raising a false alarm.
-
-    **Model characteristics**
-    - Flattened MLP architecture
-    - Class-weighted loss during training
-    - Conservative probabilistic outputs
-
-    **Current limitations**
-    - No explicit temporal modeling
-    - Reduced sensitivity to moderate activity
-    - Designed primarily for strong flare precursors
-
-    **Future improvements**
-    - Temporal CNN / LSTM architectures
-    - Probabilistic calibration on validation sets
-    - Multi-horizon forecasting
-    """)
-
-# Title
-st.title("Solar Flare Early Warning System")
-
-st.markdown("""
-This application analyzes the **last six hours of GOES X-ray flux**
-and issues a **binary early warning** for potential solar flare activity
-within the **next 60 minutes**.
-""")
-
-# Date, Weather
-def get_user_location_weather():
-    # Only cache successful lookups
-    cached = st.session_state.get("user_weather")
-    if cached is not None and cached != "Unavailable":
-        return cached
-
-    try:
-        # IP-based location (cloud-friendly)
-        loc_response = requests.get(
-            "https://ipinfo.io/json",
-            timeout=5
-        )
-        loc_data = loc_response.json()
-
-        loc = loc_data.get("loc")  # "lat,lon"
-        city = loc_data.get("city", "Your location")
-
-        if not loc:
-            raise ValueError("No location data")
-
-        latitude, longitude = map(float, loc.split(","))
-
-        weather_response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "current_weather": True
-            },
-            timeout=5
-        )
-
-        weather_data = weather_response.json()
-        temperature = weather_data["current_weather"]["temperature"]
-        if st.button("Retry location detection"):
-         st.session_state.pop("user_weather", None)
-         st.experimental_rerun()
-
-
-        st.session_state.user_weather = f"{temperature:.1f} °C ({city})"
-        return st.session_state.user_weather
-
-    except Exception:
-        
-        return "Unavailable"
-
-
-
-col_date, col_weather, col_context = st.columns(3)
-
-col_date.metric("Date", datetime.now().strftime("%d %B %Y"))
-col_weather.metric("Local Temperature (User)", get_user_location_weather())
-col_context.metric(
-    "Solar Context",
-    "Monitoring active conditions" if st.session_state.x_input is not None else "Quiet conditions"
-)
-st.caption(
-    "Local temperature is estimated from approximate IP-based user location "
-    "and is shown for contextual awareness only."
-)
-
-# Load model
+CHECKPOINT_PATH = "checkpoints/best_model.pt"
 @st.cache_resource
-def load_model():
-    checkpoint = torch.load(
-        "checkpoints/best_model.pt",
-        map_location="cpu"
-    )
-    model = SolarFlareMLP()
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
-    return model
+def load_predictor():
+    try:
+        predictor = FlarePredictor.from_checkpoint(CHECKPOINT_PATH, device="cpu")
+        return predictor, None
+    except FileNotFoundError:
+        # Graceful fallback: show the app structure even without a trained model
+        return None, (
+            f"Checkpoint not found at `{CHECKPOINT_PATH}`. "
+            "Train the model first with `python train.py`."
+        )
+    except Exception as e:
+        return None, str(e)
 
-model = load_model()
-predictor = FlarePredictor(model)
 
-st.success("Model loaded successfully")
+predictor, model_error = load_predictor()
 
+# Sidebar 
+
+with st.sidebar:
+    st.title("System Overview")
+    with st.expander("About this system", expanded=True):
+        st.markdown("""
+**Solar Flare Early Warning System**
+
+Uses a **1D-CNN + LSTM** model trained on 10 years of GOES X-ray flux
+(2010–2020) to forecast the probability of an **M-class or higher flare
+within the next 60 minutes**.
+
+**Input window:** 360 minutes (6 hours)
+
+**Feature channels (5):**
+- `xrs_short` — log₁₀ of 0.05–0.4 nm flux
+- `xrs_long` — log₁₀ of 0.1–0.8 nm flux
+- `xrs_ratio` — long − short (log-space; increases near flare)
+- `deriv_short` — 1-min derivative of short channel
+- `rolling_max` — 30-min rolling max of long channel
+
+**Evaluation metrics (test set):**
+TSS and HSS — standard space-weather skill scores.
+Accuracy is not used (useless for rare events).
+
+**Data source:** GOES-15 / GOES-16 XRS via NOAA SWPC
+
+**Disclaimer:** For decision support only.
+Always consult [NOAA SWPC](https://www.swpc.noaa.gov/) for operational alerts.
+        """)
+
+    with st.expander("Risk levels"):
+        st.markdown("""
+| Level | Probability | Meaning |
+|---|---|---|
+| HIGH | ≥ 0.75 | Strong precursor signal |
+| ELEVATED | ≥ 0.50 | Notable activity |
+| MODERATE | ≥ 0.25 | Mild activity |
+| LOW | < 0.25 | Quiet sun |
+        """)
+
+# Header 
+st.title(" Solar Flare Early Warning System")
+st.markdown(
+    "Analyzes the **last 6 hours of GOES X-ray flux** and issues a binary early warning "
+    "for potential solar flare activity within the **next 60 minutes**."
+)
+
+# Model status banner
+if model_error:
+    st.error(f" Model not loaded: {model_error}")
+elif predictor:
+    st.success(f" Model loaded  |  Decision threshold: **{predictor.threshold:.2f}**")
+
+# Status metrics row 
+
+col_date, col_utc, col_status = st.columns(3)
+col_date.metric("Date (UTC)", datetime.now(timezone.utc).strftime("%d %B %Y"))
+col_utc.metric("Time (UTC)", datetime.now(timezone.utc).strftime("%H:%M"))
+col_status.metric(
+    "Data Status",
+    "Input loaded" if st.session_state.x_input is not None else "No data loaded"
+)
+
+st.divider()
 
 # Input configuration 
-st.markdown("### Input Configuration")
+st.subheader(" Input Configuration")
 
-col_input, col_scenario = st.columns(2)
+input_mode = st.radio(
+    "Select input source",
+    ["Example scenarios", "Upload GOES CSV", "Fetch Latest GOES Data (Live)"],
+    horizontal=True,
+)
 
-with col_input:
-    input_mode = st.radio(
-        "Select input source",
-        [
-            "Example scenarios",
-            "Upload GOES CSV",
-            "Fetch Latest GOES Data (Live)"
-        ],
-        horizontal=True
-    )
+# Scenario generator  
+SCENARIOS = {
+    "Quiet Sun": {
+        "desc": "Typical background solar minimum conditions.",
+        "short_base": -7.0, "long_base": -6.5, "noise": 0.08,
+    },
+    "Elevated Activity (B/C class)": {
+        "desc": "Background activity above quiet-sun baseline, no strong flares yet.",
+        "short_base": -6.2, "long_base": -5.7, "noise": 0.18,
+    },
+    "Pre-flare Gradual Rise (C class)": {
+        "desc": "Slow flux rise consistent with pre-flare buildup.",
+        "short_base": -5.5, "long_base": -5.0, "noise": 0.22,
+        "trend": 0.003,
+    },
+    "Impulsive M-class Precursor": {
+        "desc": "Rapid flux increase in last 30 minutes — strong M-class precursor signature.",
+        "short_base": -5.0, "long_base": -4.5, "noise": 0.25,
+        "trend": 0.008, "spike_at": 330,
+    },
+}
+def generate_scenario(name: str) -> tuple:
+    cfg = SCENARIOS[name]
+    t = np.arange(360)
+    trend = cfg.get("trend", 0.0)
 
-st.session_state.input_mode = input_mode
+    xrs_short = np.random.normal(cfg["short_base"], cfg["noise"], 360) + trend * t
+    xrs_long  = np.random.normal(cfg["long_base"],  cfg["noise"], 360) + trend * t
 
-with col_scenario:
-    if input_mode == "Example scenarios":
-        scenario = st.selectbox(
-            "Example solar activity scenario",
-            [
-                "Quiet Sun",
-                "Elevated Activity",
-                "Strong Flare Signature"
-            ]
-        )
-    else:
-        scenario = None
+    if "spike_at" in cfg:
+        spike_window = np.arange(cfg["spike_at"], 360)
+        xrs_short[spike_window] += 0.015 * (spike_window - cfg["spike_at"])
+        xrs_long[spike_window]  += 0.020 * (spike_window - cfg["spike_at"])
 
-# Example scenario generator
+    xrs_ratio   = xrs_long - xrs_short
+    deriv_short = np.gradient(xrs_short)
+    rolling_max = pd.Series(xrs_long).rolling(30, min_periods=1).max().values
 
-def generate_example(scenario):
-    if scenario == "Quiet Sun":
-        base, noise = -6.0, 0.12
-    elif scenario == "Elevated Activity":
-        base, noise = -5.2, 0.25
-    else:
-        base, noise = -4.5, 0.35
+    x = np.stack([xrs_short, xrs_long, xrs_ratio, deriv_short, rolling_max], axis=1)
 
-    xrs_short = np.random.normal(base, noise, 360)
-    xrs_long = np.random.normal(base + 0.1, noise, 360)
-
-    return np.stack([xrs_short, xrs_long], axis=1)
-
-
-# Input handling
+    df = pd.DataFrame({
+        "xrs_short":   xrs_short,
+        "xrs_long":    xrs_long,
+        "xrs_ratio":   xrs_ratio,
+        "deriv_short": deriv_short,
+        "rolling_max": rolling_max,
+    })
+    return x.astype(np.float32), df
+# Handle input modes
 if input_mode == "Example scenarios":
-    st.session_state.x_input = generate_example(scenario)
-    st.session_state.goes_df = None
+    col_sel, col_desc = st.columns([1, 2])
+    with col_sel:
+        scenario = st.selectbox("Scenario", list(SCENARIOS.keys()))
+    with col_desc:
+        st.info(SCENARIOS[scenario]["desc"])
+
+    x, df = generate_scenario(scenario)
+    st.session_state.x_input     = x
+    st.session_state.goes_df     = df
     st.session_state.data_source = scenario
+    if predictor:
+        predictor.reset_history()
 
 elif input_mode == "Upload GOES CSV":
-    uploaded_file = st.file_uploader(
-        "Upload GOES CSV file",
-        type=["csv"]
+    st.markdown(
+        "Upload a CSV with at least two flux columns. Accepted column names: "
+        "`xrs_short`/`xrsa_flux`/`flux_short` and `xrs_long`/`xrsb_flux`/`flux_long`. "
+        "Must contain at least 360 rows."
     )
-
+    uploaded_file = st.file_uploader("Choose a GOES CSV file", type=["csv"])
     if uploaded_file:
-        df = pd.read_csv(uploaded_file).tail(360)
-        st.session_state.goes_df = df
-        st.session_state.x_input = df[["xrs_short", "xrs_long"]].values
-        st.session_state.data_source = "Uploaded CSV"
-
-else:
-    st.info("Fetches the most recent 6 hours of GOES X-ray flux data.")
-
-    if st.button("Fetch Latest GOES Data"):
         try:
-            from src.goes_fetcher import fetch_latest_goes_csv
-            df = fetch_latest_goes_csv().tail(360)
-            st.session_state.goes_df = df
-            st.session_state.x_input = df[["xrs_short", "xrs_long"]].values
-            st.session_state.data_source = "Live GOES Data"
-            st.success("Live GOES data loaded successfully")
-        except Exception:
-            st.session_state.goes_df = None
+            from src.goes_loader import load_goes_csv
+            x, df = load_goes_csv(uploaded_file)
+            st.session_state.x_input     = x
+            st.session_state.goes_df     = df
+            st.session_state.data_source = f"CSV: {uploaded_file.name}"
+            if predictor:
+                predictor.reset_history()
+            st.success(f"Loaded {len(df)} rows from {uploaded_file.name}")
+        except Exception as e:
+            st.error(f"Failed to load CSV: {e}")
             st.session_state.x_input = None
-            st.warning("Live GOES data currently unavailable")
 
-# Visualization
+else:  # Live GOES
+    st.info(
+        "Fetches the latest 6 hours of GOES X-ray flux from "
+        "[NOAA SWPC](https://services.swpc.noaa.gov/json/goes/primary/xrays-1-day.json)."
+    )
+    if st.button("Fetch Latest GOES Data"):
+        with st.spinner("Fetching live GOES data..."):
+            try:
+                from src.goes_fetcher import fetch_latest_goes_df, fetch_latest_goes_array
+                df = fetch_latest_goes_df()
+                x  = fetch_latest_goes_array()
+                st.session_state.x_input     = x
+                st.session_state.goes_df     = df
+                st.session_state.data_source = "Live GOES Data"
+                if predictor:
+                    predictor.reset_history()
+                st.success(
+                    f"Live data loaded: {len(df)} rows  "
+                    f"({df['time_tag'].iloc[0]} → {df['time_tag'].iloc[-1]})"
+                )
+            except Exception as e:
+                st.warning(f"Live data unavailable: {e}")
+                st.session_state.x_input = None
+
+# Visualisation 
 if st.session_state.x_input is not None:
+    st.divider()
     st.subheader("GOES X-ray Flux (Last 6 Hours)")
 
-    if st.session_state.goes_df is not None:
-        st.line_chart(
-            st.session_state.goes_df.set_index("time_tag")[["xrs_short", "xrs_long"]]
+    df_plot = st.session_state.goes_df
+    if df_plot is not None:
+        # Select which channels to display
+        display_cols = st.multiselect(
+            "Channels to display",
+            ["xrs_short", "xrs_long", "xrs_ratio", "deriv_short", "rolling_max"],
+            default=["xrs_short", "xrs_long", "xrs_ratio"],
         )
+        if display_cols:
+            chart_df = df_plot[display_cols].copy()
+            if "time_tag" in df_plot.columns:
+                chart_df.index = pd.to_datetime(df_plot["time_tag"])
+            st.line_chart(chart_df)
 
-        st.subheader("GOES Flux Table (Timestamped)")
-        st.dataframe(
-            st.session_state.goes_df,
-            use_container_width=True
-        )
-    else:
-        st.line_chart({
-            "XRS Short (log10)": st.session_state.x_input[:, 0],
-            "XRS Long (log10)": st.session_state.x_input[:, 1]
-        })
+    st.caption(f"Data source: **{st.session_state.data_source}**")
 
-    st.caption(f"Data source: {st.session_state.data_source}")
-
-
-# Prediction
+# Prediction 
+st.divider()
 st.subheader("Flare Warning Output")
 
-if st.session_state.x_input is not None and st.button("Run Prediction"):
-    raw_prob, _ = predictor.predict(st.session_state.x_input)
+if st.session_state.x_input is None:
+    st.info("Load input data above, then click **Run Prediction**.")
+elif not predictor:
+    st.warning("Model not loaded. Train the model first with `python train.py`.")
+else:
+    if st.button("▶ Run Prediction", type="primary"):
+        with st.spinner("Running inference..."):
+            prob, warning = predictor.predict(st.session_state.x_input)
+            level, emoji  = predictor.get_risk_level(prob)
+            st.session_state.prediction = {
+                "prob": prob, "warning": warning, "level": level, "emoji": emoji
+            }
 
-    # Scenario-aware calibration (demo only)
-    if st.session_state.data_source == "Strong Flare Signature":
-        prob = min(raw_prob + 0.75, 1.0)
-    elif st.session_state.data_source == "Elevated Activity":
-        prob = min(raw_prob + 0.15, 1.0)
-    else:
-        prob = raw_prob
+    pred = st.session_state.prediction
+    if pred is not None:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Flare Probability", f"{pred['prob']:.3f}")
+        c2.metric("Risk Level", f"{pred['emoji']} {pred['level']}")
+        c3.metric("Warning", "⚠ ISSUED" if pred["warning"] else "✓ NONE")
 
-    st.metric("Calibrated Flare Probability", f"{prob:.2f}")
+        if pred["warning"]:
+            st.error(
+                f"{pred['emoji']} {pred['level']} RISK — "
+                "Elevated flare probability detected for the next 60 minutes. "
+                "Monitor [NOAA SWPC](https://www.swpc.noaa.gov/) for official alerts."
+            )
+        elif pred["level"] in ("MODERATE", "ELEVATED"):
+            st.warning(
+                f"{pred['emoji']} {pred['level']} ACTIVITY — "
+                "Some X-ray flux activity present. Continue monitoring."
+            )
+        else:
+            st.success("LOW RISK: No immediate flare activity detected.")
 
-    if prob >= 0.5:
-        st.error("Flare Warning: Elevated risk within the next 60 minutes.")
-    else:
-        st.success("No Immediate Flare Risk Detected.")
+        with st.expander("Prediction details"):
+            st.markdown(f"""
+| Parameter | Value |
+|---|---|
+| Raw probability | `{pred['prob']:.4f}` |
+| Decision threshold | `{predictor.threshold:.2f}` |
+| Smoothing history (last {len(predictor.history)} steps) | `{[f'{v:.3f}' for v in predictor.get_history()]}` |
+| Risk level | {pred['emoji']} {pred['level']} |
+| Warning issued | {'Yes' if pred['warning'] else 'No'} |
+            """)
 
-    st.info(
-        "This system is designed for early warning. "
-        "Displayed probabilities are conservative and intended "
-        "for decision support rather than precise forecasting."
-    )
+        st.caption(
+            "This system is for early-warning and decision support only. "
+            "Probabilities are model estimates and may not reflect actual flare occurrence. "
+            "Always consult [NOAA SWPC](https://www.swpc.noaa.gov/) for authoritative space weather forecasts."
+        )
