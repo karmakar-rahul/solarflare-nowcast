@@ -1,0 +1,53 @@
+# config.yaml
+# -----------
+# All hyperparameters for the Solar Flare Early Warning model.
+# Edit here — no need to touch the Python files for most experiments.
+
+# ── Data paths ──────────────────────────────────────────────────────────────────
+data:
+  # Path to the GOES XRS flux CSV (converted from goes15_xrs_1m_2010_2020.nc)
+  # Columns required: time (or time_tag), flux_short (xrsa), flux_long (xrsb)
+  flux_csv: "../solarflare_goes_data/goes_xray.csv"
+
+  # Path to the flare catalog CSV with at least: peak_time, class (M1.0, X2.3, etc.)
+  flare_csv: "../solarflare_goes_data/flare_catalog.csv"
+
+  # Train/Val/Test split fractions (must sum ≤ 1.0; remainder goes to test)
+  train_frac: 0.70
+  val_frac:   0.15
+  # test_frac = 1 - train_frac - val_frac = 0.15
+  max_train_samples: 300000
+# ── Model architecture ──────────────────────────────────────────────────────────
+model:
+  n_features:  5      # xrs_short, xrs_long, xrs_ratio, deriv_short, rolling_max
+  seq_len:     360    # 6-hour look-back window (minutes)
+  cnn_channels: [32, 64]
+  kernel_size: 7
+  lstm_hidden: 128
+  lstm_layers: 1
+  dropout:     0.3
+
+# ── Loss function ───────────────────────────────────────────────────────────────
+loss:
+  # 'focal' (recommended for imbalanced data) or 'weighted_bce'
+  type:  focal
+  alpha: 0.25   # weight for positive (flare) class; increase to 0.5 if recall is too low
+  gamma: 2.0    # focusing exponent; 2.0 is standard
+
+# ── Training ────────────────────────────────────────────────────────────────────
+train:
+  epochs:          50
+  batch_size:      64      # safe for RTX 2050 4GB with mixed precision
+  learning_rate:   0.001
+  weight_decay:    0.0001  # L2 regularisation via AdamW
+  patience:        8       # early stopping patience (epochs without TSS improvement)
+  mixed_precision: true    # torch.cuda.amp  — halves VRAM, ~1.5x speedup on RTX 2050
+  num_workers:     2       # DataLoader workers; set to 0 on Windows if you see errors
+
+# ── Inference / dashboard ────────────────────────────────────────────────────────
+inference:
+  # Decision threshold for binary warning.
+  # After training, run find_best_threshold() on the val set to tune this.
+  # The trainer saves the best TSS threshold into the checkpoint automatically.
+  threshold:        0.5
+  smoothing_window: 5      # temporal smoothing over consecutive predictions
