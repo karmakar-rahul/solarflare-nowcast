@@ -26,10 +26,11 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 import yaml
 
+from tqdm import tqdm
 from src.dataset import build_datasets
 from src.focal_loss import FocalLoss, WeightedBCELoss
 from src.model import build_model
@@ -42,6 +43,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train Solar Flare Warning model")
     p.add_argument("--config", default="config.yaml", help="Path to config YAML")
     p.add_argument("--smoke", action="store_true", help="2-epoch smoke test on small subset")
+    p.add_argument("--resume", action="store_true", help="Resume training from checkpoints/last_model.pt")
     return p.parse_args()
 
 
@@ -81,7 +83,7 @@ def evaluate(model, loader, device, threshold=0.5):
 
 # Main training loop 
 
-def train(cfg: dict, smoke: bool = False):
+def train(cfg: dict, args, smoke: bool = False):
     # Device 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] Using device: {device}")
@@ -162,9 +164,28 @@ def train(cfg: dict, smoke: bool = False):
 
     # Mixed precision 
     use_amp = device.type == "cuda" and train_cfg.get("mixed_precision", True)
-    scaler  = GradScaler(enabled=use_amp)
+    scaler  = GradScaler("cuda",enabled=use_amp)
     print(f"[train] Mixed precision (AMP): {use_amp}")
+    # Resume from checkpoint
+    start_epoch  = 1
+    best_tss     = -1.0
+    patience_ctr = 0
 
+    resume_path = "checkpoints/last_model.pt"
+    if args.resume and os.path.exists(resume_path):  
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        else:
+            print("[train] No optimizer state found in checkpoint. Starting optimizer fresh.")
+        start_epoch  = ckpt.get("epoch", 1) + 1
+        best_tss     = ckpt.get("val_tss", -1.0)
+        patience_ctr = ckpt.get("patience_ctr", 0)
+        print(f"[train] Resumed from epoch {start_epoch - 1}  "
+              f"(best TSS so far: {best_tss:.4f})")
+    else:
+        print("[train] Starting fresh training run")
     # Checkpoint directory 
     os.makedirs("checkpoints", exist_ok=True)
     best_path = "checkpoints/best_model.pt"
@@ -173,24 +194,24 @@ def train(cfg: dict, smoke: bool = False):
     # Training loop 
     epochs       = 2 if smoke else train_cfg.get("epochs", 50)
     patience     = train_cfg.get("patience", 8)
-    best_tss     = -1.0
-    patience_ctr = 0
+   
 
     print(f"\n[train] Starting training for up to {epochs} epochs "
           f"(early stop patience={patience})\n{'='*60}")
 
     history = {"train_loss": [], "val_loss": [], "val_tss": [], "val_hss": []}
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         epoch_loss = 0.0
         t0 = time.time()
 
-        for x, y in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs}", unit="batch", leave=True)
+        for x, y in pbar:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=use_amp):
+            with autocast("cuda",enabled=use_amp):
                 logits = model(x).squeeze(1)
                 loss   = criterion(logits, y)
 
@@ -201,6 +222,7 @@ def train(cfg: dict, smoke: bool = False):
             scaler.update()
 
             epoch_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_train_loss = epoch_loss / len(train_loader)
         val_metrics    = evaluate(model, val_loader, device)
@@ -210,8 +232,10 @@ def train(cfg: dict, smoke: bool = False):
         scheduler.step(val_tss)
 
         elapsed = time.time() - t0
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d}/{epochs}  "
+            f"lr={current_lr:.2e}  "
             f"train_loss={avg_train_loss:.4f}  "
             f"val_loss={val_metrics['loss']:.4f}  "
             f"val_TSS={val_tss:.4f}  "
@@ -237,11 +261,22 @@ def train(cfg: dict, smoke: bool = False):
                     "optimizer_state": optimizer.state_dict(),
                     "val_tss": val_tss,
                     "val_hss": val_hss,
+                    "patience_ctr": patience_ctr,
                     "cfg": cfg,
                 },
                 best_path,
             )
             print(f"  ✓ New best TSS={best_tss:.4f} → saved to {best_path}")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_tss": best_tss,
+                    "patience_ctr": patience_ctr,
+                    "cfg": cfg,
+                },
+                last_path,)
         else:
             patience_ctr += 1
             if patience_ctr >= patience:
@@ -250,7 +285,12 @@ def train(cfg: dict, smoke: bool = False):
                 break
 
     # Save last checkpoint
-    torch.save({"epoch": epoch, "model_state": model.state_dict(), "cfg": cfg}, last_path)
+    torch.save({"epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "val_tss": best_tss,
+        "patience_ctr": patience_ctr,
+        "cfg": cfg,}, last_path)
 
     # Test set evaluation
     print("\n[train] Loading best model for final test evaluation...")
@@ -283,4 +323,4 @@ if __name__ == "__main__":
     args = parse_args()
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
-    train(cfg, smoke=args.smoke)
+    train(cfg, args, smoke=args.smoke)
